@@ -2595,10 +2595,18 @@ _CMD_COOLDOWN_S = 10     # match the HA integration's remote-action cooldown
 _last_command_at = 0.0
 
 
+def _wants_json(request: Request) -> bool:
+    """True when the client prefers JSON (e.g. HTTP-buttons on a smartwatch).
+    A plain `Accept: application/json` header is enough — no quality-value parsing needed."""
+    return "application/json" in request.headers.get("accept", "")
+
+
 @app.post("/api/command/{name}", response_class=HTMLResponse)
-async def run_command(name: str, background_tasks: BackgroundTasks):
+async def run_command(name: str, request: Request, background_tasks: BackgroundTasks):
     fn = _COMMANDS.get(name)
     if not fn:
+        if _wants_json(request):
+            return JSONResponse({"ok": False, "error": "unknown_command"}, status_code=400)
         return HTMLResponse('<span style="color:#ef4444">Unknown command</span>', status_code=400)
 
     # The car locks some controls (sunshade, trunk, windows, lock) while moving —
@@ -2608,6 +2616,8 @@ async def run_command(name: str, background_tasks: BackgroundTasks):
     warn = _blocked_while_driving(name, db_reader.get_latest_status() or {},
                                   i18n.get_t(db_reader.get_language()))
     if warn:
+        if _wants_json(request):
+            return JSONResponse({"ok": False, "error": warn, "blocked": True})
         return HTMLResponse(f'<span data-warn="1" style="color:#fbbf24">⚠️ {warn}</span>')
 
     # Remote-action cooldown (like the HA integration's 10s): don't fire commands too
@@ -2626,6 +2636,8 @@ async def run_command(name: str, background_tasks: BackgroundTasks):
         msg = _cooldown_msg.get(db_reader.get_language(), "Not sent — retry in {n}s").format(n=wait)
         # data-warn → the front-end leaves the notice up (and does NOT refresh the card, which would
         # wipe it in a flash and make the user think the command was sent).
+        if _wants_json(request):
+            return JSONResponse({"ok": False, "error": msg, "cooldown": True, "retry_in": wait})
         return HTMLResponse(f'<span data-warn="1" data-cooldown="1" style="color:#fbbf24">⏳ {msg}</span>')
     _last_command_at = time.time()
     # Boost the poller so the car's REAL state is re-polled within a few seconds (not up to 30s).
@@ -2671,6 +2683,8 @@ async def run_command(name: str, background_tasks: BackgroundTasks):
         if name in _COMFORT_CMD_OPTIMISTIC:
             _veh, _ = db_reader.get_vehicle()
             _optimistic_comfort(_veh.get("vin") if _veh else None, _COMFORT_CMD_OPTIMISTIC[name])
+        if _wants_json(request):
+            return JSONResponse({"ok": True, "status": "done"})
         return HTMLResponse('<span style="color:#22c55e">✓ Done</span>')
 
     import asyncio
@@ -2685,9 +2699,14 @@ async def run_command(name: str, background_tasks: BackgroundTasks):
         # spinner and refresh from real signals after a delay (like slow commands).
         slow = name in _SLOW_COMMANDS or field is not None
         background_tasks.add_task(_post_command_refresh, expected, epoch, 12 if slow else 3)
+        if _wants_json(request):
+            return JSONResponse({"ok": True, "status": "pending" if slow else "done"})
         if slow:
             return HTMLResponse('<span data-slow="1" style="color:#60a5fa;display:inline-flex;align-items:center;gap:4px"><svg style="animation:spin 1s linear infinite;width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg></span><style>@keyframes spin{to{transform:rotate(360deg)}}</style>')
         return HTMLResponse('<span style="color:#22c55e">✓ Done</span>')
+    if _wants_json(request):
+        outcome = command_client._classify_outcome(False, msg)
+        return JSONResponse({"ok": False, "error": msg, "outcome": outcome})
     return HTMLResponse(_cmd_error_html(msg))
 
 
